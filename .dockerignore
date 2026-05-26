@@ -1,0 +1,9 @@
+frontend/node_modules
+frontend/dist
+.npm-cache
+frontend/.npm-cache
+__pycache__
+*.pyc
+.env
+src/llm_runtime_config.json
+*.log

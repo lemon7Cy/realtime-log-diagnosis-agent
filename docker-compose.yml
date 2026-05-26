@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-8003}:8003"
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${WEB_PORT:-3003}:80"
+    depends_on:
+      - api
