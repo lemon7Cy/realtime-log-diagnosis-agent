@@ -30,6 +30,9 @@ try:
     from .agent import ReactDiagnosisAgent
     from .llm_agent import LLMReActAgent
     from .pipeline import create_agent, default_log_path, run_pipeline
+    from .correlation import AlertCorrelator
+    from .runbook import RunbookPlanner
+    from .slo import SLOImpactCalculator
 except ImportError:
     from llm_client import list_models, test_model
     from llm_config import LLMConfig, LLMConfigUpdate, LLMModelsRequest, get_llm_config, public_config, save_llm_config
@@ -41,6 +44,9 @@ except ImportError:
     from agent import ReactDiagnosisAgent
     from llm_agent import LLMReActAgent
     from pipeline import create_agent, default_log_path, run_pipeline
+    from correlation import AlertCorrelator
+    from runbook import RunbookPlanner
+    from slo import SLOImpactCalculator
 
 
 class IngestLogRequest(BaseModel):
@@ -49,6 +55,19 @@ class IngestLogRequest(BaseModel):
 
 class DiagnoseSampleRequest(BaseModel):
     log_file: str | None = None
+
+
+class CreateDiagnosisJobRequest(BaseModel):
+    log_file: str | None = None
+
+
+class DiagnosisJobRecord(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+    updated_at: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
 
 
 class ReplaySampleRequest(BaseModel):
@@ -140,8 +159,13 @@ _store = ObservabilityStore(_initial_events)
 _detector = DetectorPipeline()
 _alerts: dict[str, AlertRecord] = {}
 _reports: dict[str, str] = {}
+_jobs: dict[str, DiagnosisJobRecord] = {}
 _ws_manager = ConnectionManager()
 _alert_counter = 0
+_job_counter = 0
+_correlator = AlertCorrelator()
+_runbook_planner = RunbookPlanner()
+_slo_calculator = SLOImpactCalculator()
 
 
 def _next_alert_id() -> str:
@@ -150,13 +174,20 @@ def _next_alert_id() -> str:
     return f"alert-{_alert_counter:04d}"
 
 
+def _next_job_id() -> str:
+    global _job_counter
+    _job_counter += 1
+    return f"job-{_job_counter:04d}"
+
+
 def _reset_runtime_state() -> None:
-    global _detector, _alert_counter
+    global _detector, _alert_counter, _correlator
     _store.logs = list(_initial_events)
     _detector = DetectorPipeline()
     _alerts.clear()
     _reports.clear()
     _alert_counter = 0
+    _correlator = AlertCorrelator()
 
 
 def _diagnose_with_current_agent(anomaly: Anomaly) -> DiagnosisReport:
@@ -170,6 +201,8 @@ def _report_payload(report: DiagnosisReport) -> dict[str, Any]:
         "root_cause": report.root_cause,
         "confidence": report.confidence,
         "impact": report.impact,
+        "slo_impact": _slo_calculator.calculate(_store, report.anomaly),
+        "runbook": _runbook_planner.plan(report.anomaly, report.root_cause),
         "timeline": report.timeline,
         "evidence": report.evidence,
         "recommendations": report.recommendations,
@@ -282,6 +315,7 @@ async def ingest_log(payload: IngestLogRequest) -> dict[str, Any]:
         updated_at=now,
         report_id=report.report_id,
     )
+    incident = _correlator.correlate(anomaly)
     _alerts[alert_id] = alert
     _reports[report.report_id] = report.to_markdown()
 
@@ -289,13 +323,14 @@ async def ingest_log(payload: IngestLogRequest) -> dict[str, Any]:
     await _ws_manager.broadcast({
         "type": "new_alert",
         "alert": alert.model_dump(),
+        "incident": incident.to_dict(),
         "react_trace": [
             {"thought": step.thought, "action": step.action, "observation": step.observation}
             for step in report.react_trace
         ],
     })
 
-    return {"triggered": True, "alert_id": alert_id, "anomaly": anomaly.__dict__, "report_id": report.report_id}
+    return {"triggered": True, "alert_id": alert_id, "incident": incident.to_dict(), "anomaly": anomaly.__dict__, "report_id": report.report_id}
 
 
 # ─── 一键演示 ────────────────────────────────────────────────────────────
@@ -305,14 +340,23 @@ def diagnose_sample(payload: DiagnoseSampleRequest | None = None) -> dict[str, A
     """对 sample_app.log 跑完整检测 + ReAct 诊断，适合前端一键演示。"""
     path = Path(payload.log_file) if payload and payload.log_file else default_log_path()
     anomalies, reports = run_pipeline(path)
+    sample_store = ObservabilityStore(load_log_events(path))
+    original_logs = _store.logs
+    _store.logs = sample_store.logs
+    try:
+        report_payloads = [_report_payload(report) for report in reports]
+    finally:
+        _store.logs = original_logs
     for report in reports:
         _reports[report.report_id] = report.to_markdown()
+    incidents = [_correlator.correlate(anomaly).to_dict() for anomaly in anomalies]
     return {
         "log_file": str(path),
         "anomaly_count": len(anomalies),
         "report_count": len(reports),
         "anomalies": [anomaly.__dict__ for anomaly in anomalies],
-        "reports": [_report_payload(report) for report in reports],
+        "incidents": incidents,
+        "reports": report_payloads,
     }
 
 
@@ -336,8 +380,41 @@ async def ingest_sample(payload: ReplaySampleRequest | None = None) -> dict[str,
         "ingested": len(load_log_events(path)),
         "triggered_count": len(triggered),
         "alerts": [alert.model_dump() for alert in _alerts.values()],
+        "incidents": [incident.to_dict() for incident in _correlator.list_incidents()],
         "reports": [{"report_id": report_id, "markdown": markdown} for report_id, markdown in _reports.items()],
     }
+
+
+# ─── 异步诊断任务 ─────────────────────────────────────────────────────────
+
+@app.post("/diagnosis/jobs")
+async def create_diagnosis_job(payload: CreateDiagnosisJobRequest | None = None) -> dict[str, Any]:
+    job_id = _next_job_id()
+    now = datetime.now().isoformat(timespec="seconds")
+    job = DiagnosisJobRecord(job_id=job_id, status="running", created_at=now, updated_at=now)
+    _jobs[job_id] = job
+
+    async def _run() -> None:
+        try:
+            result = diagnose_sample(DiagnoseSampleRequest(log_file=payload.log_file if payload else None))
+            job.status = "succeeded"
+            job.result = result
+        except Exception as exc:  # pragma: no cover - defensive job boundary
+            job.status = "failed"
+            job.error = str(exc)
+        finally:
+            job.updated_at = datetime.now().isoformat(timespec="seconds")
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id, "status": job.status}
+
+
+@app.get("/diagnosis/jobs/{job_id}")
+def get_diagnosis_job(job_id: str) -> dict[str, Any]:
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.model_dump()
 
 
 # ─── 告警管理 ────────────────────────────────────────────────────────────

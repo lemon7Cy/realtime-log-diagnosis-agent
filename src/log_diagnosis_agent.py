@@ -41,6 +41,9 @@ from parser import parse_log_line, load_log_events  # noqa: E402
 from consumer import FileTailConsumer  # noqa: E402
 from detector import SlidingWindowAnomalyDetector, DetectorPipeline  # noqa: E402
 from store import ObservabilityStore  # noqa: E402
+from correlation import AlertCorrelator, Incident  # noqa: E402
+from runbook import RunbookPlanner  # noqa: E402
+from slo import SLOImpactCalculator  # noqa: E402
 from tools import ToolRegistry, TOOL_DEFINITIONS  # noqa: E402
 from agent import ReactDiagnosisAgent  # noqa: E402
 from llm_agent import LLMReActAgent  # noqa: E402

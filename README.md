@@ -8,7 +8,10 @@
 
 - 简单 tail 消费：从 `data/sample_app.log` 逐行模拟实时日志流。
 - 异常检测：基于滑动窗口统计 5xx 错误率、DB timeout / connection pool exhausted 聚集。
-- 告警冷却：对同一服务和异常类型做 cooldown，避免告警风暴。
+- 告警冷却 + 关联聚合：对同一服务和异常类型做 cooldown，并把相近时间窗口内的同类告警聚合为 incident，降低告警风暴。
+- Runbook planner：根据 anomaly kind / root cause 自动生成结构化 remediation plan（severity、actions、rollback、verify）。
+- SLO impact：基于日志窗口估算 affected requests、observed error rate 和 error budget burn rate，并写入报告 payload。
+- 异步诊断任务：支持 `/diagnosis/jobs` 后台执行 sample 诊断，通过 job id 查询状态和结果。
 - ReAct Agent：按 Thought / Action / Observation 方式自主调用诊断工具。
 - LLM 模型接入：未配置 API Key 时使用启发式 ReAct，配置模型后自动切换到 LLM tool use 诊断。
 - 工具集：
@@ -68,6 +71,25 @@ curl -X POST http://127.0.0.1:8003/diagnose/sample -H "Content-Type: application
 
 ```powershell
 curl -X POST http://127.0.0.1:8003/ingest/sample -H "Content-Type: application/json" -d "{\"reset_state\":true}"
+```
+
+工程化增强接口：
+
+```text
+POST /diagnosis/jobs             # 创建后台诊断任务，返回 job_id
+GET  /diagnosis/jobs/{job_id}    # 查询任务状态和 result
+```
+
+`/diagnose/sample` 与异步 job 的 report payload 会额外包含：
+
+```json
+{
+  "incidents": [{"incident_id": "inc-...", "alert_count": 2}],
+  "reports": [{
+    "runbook": {"severity": "High", "actions": [], "rollback": [], "verify": []},
+    "slo_impact": {"affected_requests": 8, "error_budget_burn_rate": 100.0}
+  }]
+}
 ```
 
 ### 2.1 模型配置
@@ -154,6 +176,9 @@ project3_log_diagnosis_agent/
 ├─ src/llm_config.py                      # 运行时模型配置
 ├─ src/llm_client.py                      # 模型列表与连通性测试
 ├─ src/llm_agent.py                       # LLM tool use ReAct Agent
+├─ src/correlation.py                      # 告警关联与 incident 聚合
+├─ src/runbook.py                          # 结构化修复 runbook 生成
+├─ src/slo.py                              # SLO 影响与错误预算燃烧估算
 ├─ tests/test_log_diagnosis_agent.py      # 单元测试
 ├─ requirements.txt
 └─ .env.example
