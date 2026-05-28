@@ -145,12 +145,23 @@ class ConnectionManager:
 
 # ─── App 初始化 ──────────────────────────────────────────────────────────
 
-app = FastAPI(title="Realtime Log Diagnosis Agent", version="0.2.0")
+try:
+    from .config import get_settings
+    from .log import setup_logging, get_logger
+except ImportError:
+    from config import get_settings
+    from log import setup_logging, get_logger
+
+_app_settings = get_settings()
+setup_logging(_app_settings.log_level, _app_settings.log_format)
+_logger = get_logger(__name__)
+
+app = FastAPI(title="Realtime Log Diagnosis Agent", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:3003", "http://localhost:3003"],
+    allow_origins=_app_settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -216,8 +227,14 @@ def _report_payload(report: DiagnosisReport) -> dict[str, Any]:
 # ─── Health ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "project3-log-diagnosis-agent", "version": "0.2.0"}
+def health() -> dict:
+    return {
+        "status": "ok",
+        "service": "realtime-log-diagnosis-agent",
+        "version": "2.0.0",
+        "alerts_count": len(_alerts),
+        "events_loaded": len(_initial_events),
+    }
 
 
 @app.get("/llm-config")
